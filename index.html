@@ -339,6 +339,71 @@ main{flex:1;overflow-y:auto;padding:16px 14px 110px}
 <div class="toast" id="toast"></div>
 
 <script>
+/* ===== Armazenamento persistente (IndexedDB + fallback localStorage) =====
+   Garante que os dados fiquem salvos no próprio dispositivo (inclusive celular)
+   e não se percam ao fechar/recarregar o app. */
+(function(){
+  const DB='dividex',STORE='kv',VER=1;
+  const hasIDB=(function(){try{return !!window.indexedDB}catch(e){return false}})();
+  const lsOK=(function(){try{const k='__dx_test';localStorage.setItem(k,'1');localStorage.removeItem(k);return true}catch(e){return false}})();
+  let dbp=null;
+  function openDB(){
+    if(dbp)return dbp;
+    dbp=new Promise(function(res,rej){
+      let req;
+      try{req=indexedDB.open(DB,VER)}catch(e){rej(e);return}
+      req.onupgradeneeded=function(){
+        const db=req.result;
+        if(!db.objectStoreNames.contains(STORE))db.createObjectStore(STORE);
+      };
+      req.onsuccess=function(){res(req.result)};
+      req.onerror=function(){rej(req.error)};
+    });
+    return dbp;
+  }
+  function idbGet(key){
+    return openDB().then(function(db){
+      return new Promise(function(res,rej){
+        const tx=db.transaction(STORE,'readonly');
+        const rq=tx.objectStore(STORE).get(key);
+        rq.onsuccess=function(){res(rq.result)};
+        rq.onerror=function(){rej(rq.error)};
+      });
+    });
+  }
+  function idbSet(key,value){
+    return openDB().then(function(db){
+      return new Promise(function(res,rej){
+        const tx=db.transaction(STORE,'readwrite');
+        tx.objectStore(STORE).put(value,key);
+        tx.oncomplete=function(){res()};
+        tx.onerror=function(){rej(tx.error)};
+        tx.onabort=function(){rej(tx.error)};
+      });
+    });
+  }
+  function lsGet(key){try{return localStorage.getItem(key)}catch(e){return null}}
+  function lsSet(key,value){try{localStorage.setItem(key,value);return true}catch(e){return false}}
+
+  window.storage={
+    persistent:hasIDB||lsOK,
+    async get(key){
+      if(hasIDB){
+        try{const v=await idbGet(key);if(v!=null)return{value:v}}catch(e){}
+      }
+      const lv=lsGet(key);
+      return lv!=null?{value:lv}:null;
+    },
+    async set(key,value){
+      let ok=false;
+      if(hasIDB){try{await idbSet(key,value);ok=true}catch(e){}}
+      // espelho em localStorage como rede de segurança
+      if(lsSet(key,value))ok=true;
+      if(!ok)throw new Error('no-storage');
+    }
+  };
+})();
+
 /* ===== Estado & persistência ===== */
 const KEY='caderneta-v1';
 let state={months:{},order:[],current:null};
@@ -348,20 +413,35 @@ async function load(){
   try{
     if(window.storage){
       const r=await window.storage.get(KEY);
-      if(r&&r.value){state=JSON.parse(r.value);return}
+      if(r&&r.value){state=JSON.parse(r.value);}
     }
   }catch(e){}
-  if(!window.storage)memOnly=true;
-  seed();
+  // só fica em memória se nenhum mecanismo de persistência funcionar
+  memOnly=!(window.storage&&window.storage.persistent);
+  if(!state||!state.current||!state.months||!state.months[state.current])seed();
 }
-let saveTimer=null;
+let saveTimer=null,pendingSave=false;
+function writeNow(){
+  pendingSave=false;
+  try{
+    const p=window.storage.set(KEY,JSON.stringify(state));
+    if(p&&p.catch)p.catch(function(e){console.error(e)});
+  }catch(e){console.error(e)}
+}
 function save(){
   if(memOnly)return;
+  pendingSave=true;
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(async()=>{
-    try{await window.storage.set(KEY,JSON.stringify(state))}catch(e){console.error(e)}
-  },300);
+  saveTimer=setTimeout(writeNow,300);
 }
+function flushSave(){
+  if(memOnly||!pendingSave)return;
+  clearTimeout(saveTimer);
+  writeNow();
+}
+// grava imediatamente quando o app é minimizado/fechado (essencial no celular)
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')flushSave()});
+window.addEventListener('pagehide',flushSave);
 function seed(){
   const now=new Date();
   const nome=now.toLocaleDateString('pt-BR',{month:'long'})+' '+String(now.getFullYear()).slice(2);
